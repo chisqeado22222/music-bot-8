@@ -33,6 +33,7 @@ PLAYLIST_LIMIT = 200
 PROGRESS_UPDATE_SECONDS = 1
 BOT_OWNER_ID = int(os.environ["BOT_OWNER_ID"]) if os.environ.get("BOT_OWNER_ID") else None
 FARM_DEFAULT_URL = os.environ.get("FARM_DEFAULT_URL")
+REPORT_OWNER_ID = int(os.environ.get("REPORT_OWNER_ID", "1240589249829404695"))
 
 
 def format_duration(seconds: int) -> str:
@@ -154,6 +155,7 @@ class GuildPlayer:
         self.locked_channel_id: int | None = None
         self.locked_recovering: bool = False
         self.loop_current: bool = False
+        self.farm_channel_id: int | None = None
 
     def elapsed(self) -> int:
         if self.started_at is None:
@@ -256,6 +258,7 @@ class GuildPlayer:
         self.current = None
         self.next_override = None
         self.loop_current = False
+        self.farm_channel_id = None
         if self.voice_client:
             self.voice_client.stop()
             await self.voice_client.disconnect()
@@ -290,6 +293,92 @@ class GuildPlayer:
         if self.queue:
             embed.set_footer(text=f"{len(self.queue)} canción(es) en cola")
         return embed, NowPlayingView(self)
+
+
+class MoveConfirmView(discord.ui.View):
+    def __init__(self, author: discord.Member):
+        super().__init__(timeout=30)
+        self.author = author
+        self.result: asyncio.Future = asyncio.get_event_loop().create_future()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author.id:
+            await interaction.response.send_message(
+                "❌ Solo quien usó el comando puede decidir esto.", ephemeral=True
+            )
+            return False
+        return True
+
+    def _disable_all(self):
+        for child in self.children:
+            child.disabled = True
+
+    @discord.ui.button(label="Mover de todos modos", style=discord.ButtonStyle.success, emoji="✅")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self._disable_all()
+        await interaction.response.edit_message(content="✅ Moviendo al nuevo canal...", embed=None, view=self)
+        if not self.result.done():
+            self.result.set_result(True)
+
+    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.danger, emoji="❌")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self._disable_all()
+        await interaction.response.edit_message(content="❌ Cancelado, no me moví.", embed=None, view=self)
+        if not self.result.done():
+            self.result.set_result(False)
+
+    async def on_timeout(self):
+        if not self.result.done():
+            self.result.set_result(False)
+
+
+async def ensure_voice_connection(ctx: commands.Context, player: "GuildPlayer") -> bool:
+    """Conecta o mueve el bot al canal del autor. Devuelve False si no se debe continuar."""
+    target_channel = ctx.author.voice.channel
+
+    if player.voice_client is None:
+        player.voice_client = await target_channel.connect()
+        return True
+
+    if player.voice_client.channel.id == target_channel.id:
+        return True
+
+    current_channel = player.voice_client.channel
+
+    if player.locked:
+        await ctx.send(
+            f"🔒 Estoy fijado (lock) en **{current_channel.name}** y no me puedo mover. "
+            "Pídele al owner del bot que quite el modo lock ahí primero."
+        )
+        return False
+
+    if player.loop_current:
+        await ctx.send(
+            f"🌾 Estoy en modo farm en **{current_channel.name}** y no me puedo mover. "
+            "Pídele al owner del bot que apague el modo farm ahí primero."
+        )
+        return False
+
+    embed = discord.Embed(
+        title="⚠️ Ya estoy en otro canal",
+        description=(
+            f"Estoy en **{current_channel.name}**. ¿Quieres que me mueva a **{target_channel.name}**?"
+        ),
+        color=discord.Color.orange(),
+    )
+    view = MoveConfirmView(ctx.author)
+    msg = await ctx.send(embed=embed, view=view)
+    confirmed = await view.result
+    try:
+        await msg.delete()
+    except discord.HTTPException:
+        pass
+
+    if not confirmed:
+        return False
+
+    await player.voice_client.move_to(target_channel)
+    return True
 
 
 class NowPlayingView(discord.ui.View):
@@ -355,7 +444,7 @@ class Music(commands.Cog):
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):
         if member.id == self.bot.user.id:
-            await self._enforce_lock(member.guild, before, after)
+            await self._enforce_protected_channel(member.guild, before, after)
             return
         if member.bot:
             return
@@ -369,41 +458,102 @@ class Music(commands.Cog):
             if not any(not m.bot for m in vc_channel.members):
                 player.start_idle_timer()
 
-    async def _enforce_lock(self, guild: discord.Guild, before, after):
+    async def _find_recent_culprit(self, guild: discord.Guild, action, max_age_seconds: float = 15.0):
+        """Busca en el audit log una entrada RECIENTE cuyo objetivo sea este bot. Devuelve None si no hay certeza."""
+        try:
+            async for entry in guild.audit_logs(limit=10, action=action):
+                if entry.target is None or entry.target.id != self.bot.user.id:
+                    continue
+                age = (discord.utils.utcnow() - entry.created_at).total_seconds()
+                if age > max_age_seconds:
+                    return None  # las entradas vienen de más nueva a más vieja; si ya es vieja, no hay match confiable
+                return entry.user
+        except discord.Forbidden:
+            return None
+        return None
+
+    async def _report_disconnect(self, guild: discord.Guild, mode: str, channel_id: int, culprit):
+        try:
+            owner = await self.bot.fetch_user(REPORT_OWNER_ID)
+        except discord.HTTPException:
+            return
+        channel = guild.get_channel(channel_id)
+        channel_name = channel.name if channel else "canal desconocido"
+        mode_label = "🔒 lock" if mode == "lock" else "🌾 farm"
+        if culprit is not None:
+            who = f"**{culprit}** (`{culprit.id}`)"
+        else:
+            who = "No pude confirmar con certeza quién fue (sin permiso de ver audit log, o no hubo una entrada reciente que apuntara a mí)."
+        embed = discord.Embed(
+            title="⚠️ Me desconectaron/movieron estando protegido",
+            description=(
+                f"Servidor: **{guild.name}**\n"
+                f"Canal: **{channel_name}**\n"
+                f"Modo: {mode_label}\n"
+                f"Responsable: {who}"
+            ),
+            color=discord.Color.red(),
+            timestamp=discord.utils.utcnow(),
+        )
+        try:
+            await owner.send(embed=embed)
+        except discord.HTTPException:
+            pass
+
+    async def _enforce_protected_channel(self, guild: discord.Guild, before, after):
         player = self.players.get(guild.id)
-        if not player or not player.locked:
+        if not player:
             return
-        if before.channel is None or before.channel.id != player.locked_channel_id:
+
+        if player.locked and before.channel is not None and before.channel.id == player.locked_channel_id:
+            protected_channel_id = player.locked_channel_id
+            mode = "lock"
+        elif (
+            player.loop_current
+            and player.farm_channel_id
+            and before.channel is not None
+            and before.channel.id == player.farm_channel_id
+        ):
+            protected_channel_id = player.farm_channel_id
+            mode = "farm"
+        else:
             return
-        if after.channel is not None and after.channel.id == player.locked_channel_id:
+
+        if after.channel is not None and after.channel.id == protected_channel_id:
             return
 
         player.locked_recovering = True
 
-        await asyncio.sleep(1)  # dar tiempo a que la entrada aparezca en el audit log
+        await asyncio.sleep(1.5)  # dar tiempo a que la entrada aparezca en el audit log
         action = discord.AuditLogAction.member_disconnect if after.channel is None else discord.AuditLogAction.member_move
-        culprit = None
-        try:
-            async for entry in guild.audit_logs(limit=5, action=action):
-                culprit = entry.user
-                break
-        except discord.Forbidden:
-            culprit = None
+        culprit = await self._find_recent_culprit(guild, action)
+
+        reason_text = (
+            "Desconectó/movió al bot de música estando fijado (lock) a un canal."
+            if mode == "lock"
+            else "Desconectó/movió al bot de música estando en modo farm en un canal."
+        )
 
         if culprit is not None:
             try:
-                await guild.kick(culprit, reason="Desconectó/movió al bot de música estando fijado a un canal.")
+                await guild.kick(culprit, reason=reason_text)
             except discord.Forbidden:
                 pass
 
-        channel = guild.get_channel(player.locked_channel_id)
+        await self._report_disconnect(guild, mode, protected_channel_id, culprit)
+
+        channel = guild.get_channel(protected_channel_id)
         if channel is not None:
             player.voice_client = await channel.connect()
             player.locked_recovering = False
-            if player.current:
+            if mode == "farm" and player.current is not None:
+                track = player.current
+                track.stream_url = None
+                await player._start(track)
+            elif player.current:
                 player.queue.appendleft(player.current)
                 player.current = None
-            await player.play_next()
+                await player.play_next()
         else:
             player.locked_recovering = False
 
@@ -436,6 +586,40 @@ class Music(commands.Cog):
             self.players[guild_id] = GuildPlayer(self.bot)
         return self.players[guild_id]
 
+    def _prefixes_display(self) -> str:
+        prefix = self.bot.command_prefix
+        if isinstance(prefix, (list, tuple)):
+            return ", ".join(prefix)
+        return str(prefix)
+
+    def _status_line(self, player: "GuildPlayer") -> str:
+        if player.voice_client is None:
+            channel_desc = "no estoy en ningún canal de voz"
+        else:
+            channel_desc = f"estoy en **{player.voice_client.channel.name}**"
+            if player.locked:
+                channel_desc += " (🔒 lock)"
+            elif player.loop_current:
+                channel_desc += " (🌾 farm)"
+        return f"{channel_desc}. Mis prefijos son: `{self._prefixes_display()}`."
+
+    @commands.command(name="sts")
+    async def status(self, ctx: commands.Context):
+        mentioned_bots = [m for m in ctx.message.mentions if m.bot]
+        if mentioned_bots and ctx.guild.me not in mentioned_bots:
+            return  # se mencionaron bots específicos y este no es uno de ellos
+
+        player = self.get_player(ctx.guild.id)
+        service_name = (
+            os.environ.get("RAILWAY_SERVICE_NAME")
+            or os.environ.get("RAILWAY_GIT_REPO_NAME")
+            or "desconocido (no está en Railway o falta la variable)"
+        )
+        embed = discord.Embed(title=f"🤖 Estado de {ctx.guild.me.display_name}", color=discord.Color.blurple())
+        embed.add_field(name="Servicio en Railway", value=service_name, inline=False)
+        embed.add_field(name="Canal / modo", value=self._status_line(player), inline=False)
+        await ctx.send(embed=embed)
+
     @commands.command(name="play")
     async def play(self, ctx: commands.Context, *, query: str):
         if ctx.author.voice is None or ctx.author.voice.channel is None:
@@ -443,10 +627,8 @@ class Music(commands.Cog):
             return
 
         player = self.get_player(ctx.guild.id)
-        if player.voice_client is None:
-            player.voice_client = await ctx.author.voice.channel.connect()
-        elif player.voice_client.channel != ctx.author.voice.channel:
-            await player.voice_client.move_to(ctx.author.voice.channel)
+        if not await ensure_voice_connection(ctx, player):
+            return
 
         is_playlist = "list=" in query
 
@@ -475,6 +657,17 @@ class Music(commands.Cog):
 
     @commands.command(name="farm", aliases=["join"])
     async def farm(self, ctx: commands.Context, *, query: str = None):
+        mentioned_bots = [m for m in ctx.message.mentions if m.bot]
+        if mentioned_bots:
+            if ctx.guild.me not in mentioned_bots:
+                return  # este bot no fue mencionado, ignorar
+            for m in ctx.message.mentions:
+                query = (query or "").replace(m.mention, "").replace(f"<@!{m.id}>", "").replace(f"<@{m.id}>", "")
+            query = query.strip() or None
+
+            player = self.get_player(ctx.guild.id)
+            await ctx.send(f"👋 {ctx.guild.me.mention} — {self._status_line(player)}")
+
         if query is None:
             query = FARM_DEFAULT_URL
             if not query:
@@ -486,10 +679,8 @@ class Music(commands.Cog):
             return
 
         player = self.get_player(ctx.guild.id)
-        if player.voice_client is None:
-            player.voice_client = await ctx.author.voice.channel.connect()
-        elif player.voice_client.channel != ctx.author.voice.channel:
-            await player.voice_client.move_to(ctx.author.voice.channel)
+        if not await ensure_voice_connection(ctx, player):
+            return
 
         async with ctx.typing():
             try:
@@ -500,6 +691,7 @@ class Music(commands.Cog):
 
         track.requester = ctx.author
         player.loop_current = True
+        player.farm_channel_id = player.voice_client.channel.id
         player.next_override = track
         if player.voice_client.is_playing() or player.voice_client.is_paused():
             player.voice_client.stop()
@@ -546,12 +738,21 @@ class Music(commands.Cog):
             inline=False,
         )
         embed.add_field(
-            name="!farm / #join [link o nombre]",
+            name="!farm / #join [link o nombre] / #join @bot1 @bot2",
             value=(
                 "Reproduce esa canción en bucle infinito, para quedarte fijo en el canal de voz "
                 "acumulando horas. Si no pones nada, usa el link configurado en `FARM_DEFAULT_URL`. "
-                "`#join` es el prefijo compartido: úsalo para que este bot y los otros 3 se unan y "
-                "empiecen a farmear todos al mismo tiempo. Se detiene con el botón ⏹ Detener."
+                "`#join` es el prefijo compartido para que varios bots respondan a la vez. "
+                "Si mencionas bots específicos (`#join @bot1 @bot2`), solo esos se unen y cada uno "
+                "responde primero con su estado actual. Se detiene con el botón ⏹ Detener."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="#sts [@bot1 @bot2]",
+            value=(
+                "Cada bot dice a qué servicio de Railway está conectado, en qué canal está y en qué modo "
+                "(lock/farm). Si mencionas bots específicos, solo esos responden."
             ),
             inline=False,
         )
@@ -559,8 +760,18 @@ class Music(commands.Cog):
             name="!lock",
             value=(
                 "Solo el dueño del servidor o el dueño del bot. Fija/desfija el bot al canal de voz actual. "
-                "Con el modo activo, si alguien lo desconecta o lo mueve de canal, es expulsado del servidor "
-                "y el bot se reconecta y retoma la música desde el inicio de la canción."
+                "Con el modo activo (o en modo farm), si alguien lo desconecta o lo mueve de canal, es "
+                "expulsado del servidor (si el audit log confirma quién fue) y el bot se reconecta solo. "
+                "Además se manda un reporte por DM al owner del bot."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Al usar !play en otro canal",
+            value=(
+                "Si ya estoy tocando música en otro canal (sin lock ni farm), te pregunto con botones "
+                "si quieres que me mueva. Si estoy en lock o farm en otro canal, simplemente no me muevo "
+                "y te aviso que hay que pedirle al owner que lo quite ahí primero."
             ),
             inline=False,
         )
