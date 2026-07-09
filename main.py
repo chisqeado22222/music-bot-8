@@ -18,7 +18,7 @@ log.info(f"DIAGNOSTICO DENO: {'encontrado en ' + deno_path if deno_path else 'NO
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(command_prefix=["n", "#"], intents=intents, help_command=None)
+bot = commands.Bot(command_prefix=["r", "#"], intents=intents, help_command=None)
 
 
 @bot.event
